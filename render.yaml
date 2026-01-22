@@ -9,4 +9,4 @@ services:
       apt-get install -y tesseract-ocr-eng
       apt-get install -y poppler-utils
       pip install -r requirements.txt
-    startCommand: bash start.sh
+    
