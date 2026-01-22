@@ -2,11 +2,13 @@ services:
   - type: web
     name: smart-ai-backend
     env: python
-    buildCommand: |
-      apt-get update
-      apt-get install -y tesseract-ocr
-      apt-get install -y tesseract-ocr-ara
-      apt-get install -y tesseract-ocr-eng
-      apt-get install -y poppler-utils
-      pip install -r requirements.txt
-    
+
+    aptPackages:
+      - tesseract-ocr
+      - tesseract-ocr-ara
+      - tesseract-ocr-eng
+      - poppler-utils
+
+    buildCommand: pip install -r requirements.txt
+
+    startCommand: python -m uvicorn main:app --host 0.0.0.0 --port $PORT
