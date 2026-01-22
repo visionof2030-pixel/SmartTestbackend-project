@@ -20,6 +20,7 @@ app.add_middleware(
 )
 
 MODEL = "gemini-2.5-flash-lite"
+
 keys = [os.getenv(f"GEMINI_KEY_{i}") for i in range(1, 12)]
 keys = [k for k in keys if k]
 if not keys:
@@ -39,25 +40,24 @@ def preprocess_image(img: Image.Image) -> Image.Image:
     return img
 
 def ocr_image(img: Image.Image) -> str:
-    config = "--psm 6"
     return pytesseract.image_to_string(
         img,
         lang="ara+eng",
-        config=config
+        config="--psm 6"
     )
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
-    text = ""
+    extracted_text = ""
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text and len(page_text.strip()) > 50:
-                text += page_text + "\n"
+            text = page.extract_text()
+            if text and len(text.strip()) > 50:
+                extracted_text += text + "\n"
             else:
                 img = page.to_image(resolution=300).original
                 img = preprocess_image(img)
-                text += ocr_image(img) + "\n"
-    return text.strip()
+                extracted_text += ocr_image(img) + "\n"
+    return extracted_text.strip()
 
 def extract_text_from_image(file_bytes: bytes) -> str:
     img = Image.open(io.BytesIO(file_bytes))
@@ -105,6 +105,7 @@ async def ask_file(
 ):
     try:
         content = await file.read()
+
         if file.filename.lower().endswith(".pdf"):
             text = extract_text_from_pdf(content)
         else:
@@ -120,6 +121,11 @@ async def ask_file(
         raw = response.text
         start = raw.find("{")
         end = raw.rfind("}") + 1
-        data = json.loads(raw[start:end])
+        result = json.loads(raw[start:end])
 
-        return
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
