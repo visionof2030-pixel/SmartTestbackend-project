@@ -18,5 +18,3 @@ langdetect
 regex
 
 tiktoken
-
-requests
