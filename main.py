@@ -2,7 +2,8 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
-import os, json, itertools
+import pdfplumber
+import io, os, json, itertools
 
 app = FastAPI()
 
@@ -26,21 +27,49 @@ def get_model():
     genai.configure(api_key=next(key_cycle))
     return genai.GenerativeModel(MODEL)
 
-def build_prompt(text: str, lang: str, count: int):
-    lang_instruction = (
-        "Write the final output in clear academic English."
-        if lang == "en"
-        else "اكتب الناتج النهائي باللغة العربية الفصحى."
-    )
-    return f"""
-{lang_instruction}
+def extract_text(file: UploadFile, raw: bytes) -> str:
+    name = file.filename.lower()
 
-أنشئ {count} سؤال اختيار من متعدد من النص التالي.
+    if name.endswith(".txt"):
+        return raw.decode("utf-8", errors="ignore")
+
+    if name.endswith(".pdf"):
+        text = ""
+        with pdfplumber.open(io.BytesIO(raw)) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+        return text
+
+    return raw.decode("utf-8", errors="ignore")
+
+def build_prompt(text: str, lang: str, count: int):
+    if lang == "en":
+        lang_rule = "Write the final output in clear English."
+    else:
+        lang_rule = "اكتب الناتج النهائي باللغة العربية الفصحى."
+
+    return f"""
+{lang_rule}
+
+المحتوى التالي قد يكون:
+- كلمة واحدة
+- عبارة قصيرة
+- موضوع عام
+- أو نصًا طويلًا
+
+المطلوب:
+أنشئ {count} سؤال اختيار من متعدد اعتمادًا على المحتوى فقط.
+إذا كان المحتوى كلمة واحدة أو موضوعًا عامًا:
+استنتج الأسئلة من المعرفة العامة المرتبطة به.
 
 قواعد صارمة:
 - 4 خيارات لكل سؤال
-- شرح للإجابة الصحيحة
-- أعد JSON فقط
+- إجابة واحدة صحيحة
+- شرح مختصر للإجابة الصحيحة
+- شرح مختصر لكل خيار خاطئ
+- أعد JSON فقط بدون أي نص إضافي
 
 الصيغة:
 {{
@@ -54,7 +83,7 @@ def build_prompt(text: str, lang: str, count: int):
  ]
 }}
 
-النص:
+المحتوى:
 {text}
 """
 
@@ -64,24 +93,22 @@ async def ask_file(
     language: str = Form("ar"),
     num_questions: int = Form(10)
 ):
-    content = await file.read()
-    try:
-        text = content.decode("utf-8", errors="ignore")
-    except:
-        raise HTTPException(status_code=400, detail="Invalid text")
+    raw = await file.read()
+    text = extract_text(file, raw).strip()
 
-    if len(text.strip()) < 50:
-        raise HTTPException(status_code=400, detail="Text too short")
+    if not text:
+        raise HTTPException(status_code=400, detail="المحتوى فارغ")
 
     model = get_model()
-    prompt = build_prompt(text, language, num_questions)
-    response = model.generate_content(prompt)
+    response = model.generate_content(
+        build_prompt(text, language, num_questions)
+    )
 
-    raw = response.text
-    start = raw.find("{")
-    end = raw.rfind("}") + 1
+    raw_out = response.text or ""
+    start = raw_out.find("{")
+    end = raw_out.rfind("}") + 1
 
     if start == -1 or end == -1:
-        raise HTTPException(status_code=500, detail="Invalid model response")
+        raise HTTPException(status_code=500, detail="رد غير صالح من النموذج")
 
-    return json.loads(raw[start:end])
+    return json.loads(raw_out[start:end])
