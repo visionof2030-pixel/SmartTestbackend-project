@@ -1,9 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import os
-import io
-import re
-import tempfile
+import os, re, tempfile, itertools, json
 import pdfplumber
 import fitz
 import pytesseract
@@ -11,11 +8,29 @@ import cv2
 import numpy as np
 from PIL import Image
 from docx import Document
-from langdetect import detect
 import google.generativeai as genai
 import tiktoken
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+MODEL_NAME = "gemini-2.5-flash-lite"
+MAX_RETRY = 2
+
+keys = [os.getenv(f"GEMINI_KEY_{i}") for i in range(1, 12)]
+keys = [k for k in keys if k]
+if not keys:
+    raise RuntimeError("No Gemini API keys found")
+
+key_cycle = itertools.cycle(keys)
+
+def get_model():
+    genai.configure(api_key=next(key_cycle))
+    return genai.GenerativeModel(
+        MODEL_NAME,
+        generation_config={
+            "temperature": 0.3,
+            "top_p": 0.9,
+            "max_output_tokens": 2048
+        }
+    )
 
 app = FastAPI()
 
@@ -27,8 +42,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL = genai.GenerativeModel("gemini-pro")
-
 def clean_text(text: str) -> str:
     text = re.sub(r'\n+', '\n', text)
     text = re.sub(r'[^\w\u0600-\u06FF\s.,:;!?()-]', '', text)
@@ -37,32 +50,25 @@ def clean_text(text: str) -> str:
 def split_text(text: str, max_tokens=900):
     enc = tiktoken.get_encoding("cl100k_base")
     tokens = enc.encode(text)
-    chunks = []
-    for i in range(0, len(tokens), max_tokens):
-        chunk = enc.decode(tokens[i:i + max_tokens])
-        chunks.append(chunk)
-    return chunks
+    return [enc.decode(tokens[i:i + max_tokens]) for i in range(0, len(tokens), max_tokens)]
 
-def extract_text_pdf(file_path: str) -> str:
+def extract_text_pdf(path: str) -> str:
     text = ""
-    try:
-        with pdfplumber.open(file_path) as pdf:
-            for page in pdf.pages:
-                text += page.extract_text() or ""
-    except:
-        pass
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            text += page.extract_text() or ""
     return text.strip()
 
-def extract_text_pdf_fitz(file_path: str) -> str:
+def extract_text_pdf_fitz(path: str) -> str:
     text = ""
-    doc = fitz.open(file_path)
+    doc = fitz.open(path)
     for page in doc:
         text += page.get_text()
     return text.strip()
 
-def extract_text_docx(file_path: str) -> str:
-    doc = Document(file_path)
-    return "\n".join([p.text for p in doc.paragraphs])
+def extract_text_docx(path: str) -> str:
+    doc = Document(path)
+    return "\n".join(p.text for p in doc.paragraphs)
 
 def preprocess_image(img: Image.Image) -> Image.Image:
     img = np.array(img)
@@ -80,74 +86,103 @@ def quality_check(text: str) -> bool:
     bad_ratio = len(re.findall(r'[^\w\s]', text)) / max(len(text), 1)
     return bad_ratio < 0.35
 
-def generate_ai(prompt: str) -> str:
-    response = MODEL.generate_content(prompt)
-    return response.text
+def safe_json(text: str):
+    try:
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        return json.loads(text[start:end])
+    except:
+        return None
+
+def lang_instruction(lang: str):
+    return "Write the final output in clear academic English." if lang == "en" else "اكتب الناتج النهائي باللغة العربية الفصحى."
+
+def build_prompt(topic: str, lang: str, count: int):
+    return f"""
+{lang_instruction(lang)}
+
+أنشئ {count} سؤال اختيار من متعدد من الموضوع التالي.
+
+قواعد صارمة:
+- 4 خيارات لكل سؤال
+- شرح موسع وعميق للإجابة الصحيحة
+- شرح مختصر لكل خيار خاطئ
+- لا تكرر الأفكار
+- مستوى تعليمي واضح
+- أعد JSON فقط
+
+الصيغة:
+{{
+ "questions":[
+  {{
+   "q":"",
+   "options":["","","",""],
+   "answer":0,
+   "explanations":["","","",""]
+  }}
+ ]
+}}
+
+الموضوع:
+{topic}
+"""
+
+def generate_batch(topic: str, batch_size: int, language: str):
+    batch_size = min(max(batch_size, 5), 20)
+    for attempt in range(MAX_RETRY + 1):
+        try:
+            model = get_model()
+            prompt = build_prompt(topic, language, batch_size)
+            response = model.generate_content(prompt)
+            data = safe_json(response.text)
+            if not data or "questions" not in data:
+                raise ValueError("Invalid JSON")
+            if len(data["questions"]) < batch_size:
+                raise ValueError("Insufficient questions")
+            return data["questions"][:batch_size]
+        except Exception:
+            if attempt == MAX_RETRY:
+                raise HTTPException(status_code=500, detail="Generation failed")
 
 @app.post("/ask-file")
 async def ask_file(
     file: UploadFile = File(...),
     language: str = Form("ar"),
-    num_questions: int = Form(10),
-    mode: str = Form("questions")
+    num_questions: int = Form(10)
 ):
     suffix = os.path.splitext(file.filename)[1].lower()
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(await file.read())
-        tmp_path = tmp.name
+        path = tmp.name
 
-    extracted_text = ""
+    text = ""
 
-    if suffix in [".pdf"]:
-        extracted_text = extract_text_pdf(tmp_path)
-        if not quality_check(extracted_text):
-            extracted_text = extract_text_pdf_fitz(tmp_path)
-
-    elif suffix in [".docx"]:
-        extracted_text = extract_text_docx(tmp_path)
-
+    if suffix == ".pdf":
+        text = extract_text_pdf(path)
+        if not quality_check(text):
+            text = extract_text_pdf_fitz(path)
+    elif suffix == ".docx":
+        text = extract_text_docx(path)
     elif suffix in [".jpg", ".jpeg", ".png"]:
-        img = Image.open(tmp_path)
-        img = preprocess_image(img)
-        extracted_text = ocr_image(img, language)
-
+        img = preprocess_image(Image.open(path))
+        text = ocr_image(img, language)
     else:
-        raise HTTPException(status_code=400, detail="Unsupported file type")
+        raise HTTPException(status_code=400, detail="Unsupported file")
 
-    if not quality_check(extracted_text):
-        raise HTTPException(
-            status_code=422,
-            detail="Low quality text extracted"
-        )
+    if not quality_check(text):
+        raise HTTPException(status_code=422, detail="Low quality text")
 
-    extracted_text = clean_text(extracted_text)
-    chunks = split_text(extracted_text)
+    text = clean_text(text)
+    chunks = split_text(text)
 
-    final_prompt = ""
+    all_questions = []
+    remaining = num_questions
 
-    if mode == "questions":
-        final_prompt = f"""
-اعتمد فقط على النص التالي وأنشئ {num_questions} أسئلة اختيار من متعدد مع الإجابات والتفسير بصيغة JSON:
-{text}
-"""
-    elif mode == "flashcards":
-        final_prompt = f"""
-اعتمد فقط على النص التالي وأنشئ {num_questions} بطاقات تعليمية بصيغة JSON:
-{text}
-"""
-    elif mode == "summary":
-        final_prompt = f"""
-لخّص النص التالي تلخيصًا واضحًا ومباشرًا:
-{text}
-"""
-    else:
-        raise HTTPException(status_code=400, detail="Invalid mode")
-
-    results = []
     for chunk in chunks:
-        prompt = final_prompt.replace("{text}", chunk)
-        results.append(generate_ai(prompt))
+        if remaining <= 0:
+            break
+        batch = generate_batch(chunk, remaining, language)
+        all_questions.extend(batch)
+        remaining -= len(batch)
 
-    return {
-        "result": "\n".join(results)
-    }
+    return {"questions": all_questions}
