@@ -1,25 +1,12 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import pdfplumber
-import pytesseract
-from PIL import Image, ImageEnhance, ImageFilter
-import io
-import google.generativeai as genai
+# main.py
 import os
 import json
 import itertools
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+import google.generativeai as genai
 
 MODEL = "gemini-2.5-flash-lite"
+MAX_RETRY = 2
 
 keys = [os.getenv(f"GEMINI_KEY_{i}") for i in range(1, 12)]
 keys = [k for k in keys if k]
@@ -32,53 +19,33 @@ def get_model():
     genai.configure(api_key=next(key_cycle))
     return genai.GenerativeModel(MODEL)
 
-def preprocess_image(img: Image.Image) -> Image.Image:
-    img = img.convert("L")
-    img = ImageEnhance.Contrast(img).enhance(2.5)
-    img = img.filter(ImageFilter.MedianFilter())
-    img = img.point(lambda x: 0 if x < 140 else 255, "1")
-    return img
+def safe_json(text: str):
+    try:
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        return json.loads(text[start:end])
+    except:
+        return None
 
-def ocr_image(img: Image.Image) -> str:
-    return pytesseract.image_to_string(
-        img,
-        lang="ara+eng",
-        config="--psm 6"
+def lang_instruction(lang: str):
+    return (
+        "Write the final output in clear academic English."
+        if lang == "en"
+        else "اكتب الناتج النهائي باللغة العربية الفصحى."
     )
 
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    extracted_text = ""
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text and len(text.strip()) > 50:
-                extracted_text += text + "\n"
-            else:
-                img = page.to_image(resolution=300).original
-                img = preprocess_image(img)
-                extracted_text += ocr_image(img) + "\n"
-    return extracted_text.strip()
-
-def extract_text_from_image(file_bytes: bytes) -> str:
-    img = Image.open(io.BytesIO(file_bytes))
-    img = preprocess_image(img)
-    return ocr_image(img).strip()
-
-def build_prompt(text: str, lang: str, count: int) -> str:
-    lang_instruction = (
-        "اكتب الناتج النهائي باللغة العربية الفصحى."
-        if lang == "ar"
-        else "Write the final output in clear academic English."
-    )
+def build_prompt(topic: str, lang: str, count: int):
     return f"""
-{lang_instruction}
+{lang_instruction(lang)}
 
-أنشئ {count} سؤال اختيار من متعدد من النص التالي.
+أنشئ {count} سؤال اختيار من متعدد من الموضوع التالي.
 
 قواعد صارمة:
 - 4 خيارات لكل سؤال
-- شرح موسع للإجابة الصحيحة
+- شرح موسع وعميق للإجابة الصحيحة
 - شرح مختصر لكل خيار خاطئ
+- لا تكرر الأفكار
+- مستوى تعليمي واضح
 - أعد JSON فقط
 
 الصيغة:
@@ -93,39 +60,38 @@ def build_prompt(text: str, lang: str, count: int) -> str:
  ]
 }}
 
-النص:
-{text}
+الموضوع:
+{topic}
 """
+
+app = FastAPI()
 
 @app.post("/ask-file")
 async def ask_file(
     file: UploadFile = File(...),
     language: str = Form("ar"),
-    num_questions: int = Form(10)
+    num_questions: int = Form(10),
+    mode: str = Form("questions")
 ):
+    content = await file.read()
     try:
-        content = await file.read()
+        text = content.decode("utf-8", errors="ignore")
+    except:
+        raise HTTPException(status_code=400, detail="Invalid file")
 
-        if file.filename.lower().endswith(".pdf"):
-            text = extract_text_from_pdf(content)
-        else:
-            text = extract_text_from_image(content)
+    batch_size = min(max(num_questions, 5), 20)
 
-        if len(text) < 100:
-            raise HTTPException(status_code=400, detail="Extracted text too short")
+    for attempt in range(MAX_RETRY + 1):
+        try:
+            model = get_model()
+            prompt = build_prompt(text, language, batch_size)
+            response = model.generate_content(prompt)
+            data = safe_json(response.text)
 
-        model = get_model()
-        prompt = build_prompt(text, language, num_questions)
-        response = model.generate_content(prompt)
+            if not data or "questions" not in data:
+                raise ValueError("Invalid JSON from model")
 
-        raw = response.text
-        start = raw.find("{")
-        end = raw.rfind("}") + 1
-        result = json.loads(raw[start:end])
-
-        return result
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            return data
+        except Exception as e:
+            if attempt == MAX_RETRY:
+                raise HTTPException(status_code=500, detail=str(e))
