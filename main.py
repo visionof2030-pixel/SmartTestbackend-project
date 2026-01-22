@@ -1,12 +1,19 @@
 # main.py
-import os
-import json
-import itertools
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
+import os, json, itertools
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 MODEL = "gemini-2.5-flash-lite"
-MAX_RETRY = 2
 
 keys = [os.getenv(f"GEMINI_KEY_{i}") for i in range(1, 12)]
 keys = [k for k in keys if k]
@@ -19,33 +26,20 @@ def get_model():
     genai.configure(api_key=next(key_cycle))
     return genai.GenerativeModel(MODEL)
 
-def safe_json(text: str):
-    try:
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        return json.loads(text[start:end])
-    except:
-        return None
-
-def lang_instruction(lang: str):
-    return (
+def build_prompt(text: str, lang: str, count: int):
+    lang_instruction = (
         "Write the final output in clear academic English."
         if lang == "en"
         else "اكتب الناتج النهائي باللغة العربية الفصحى."
     )
-
-def build_prompt(topic: str, lang: str, count: int):
     return f"""
-{lang_instruction(lang)}
+{lang_instruction}
 
-أنشئ {count} سؤال اختيار من متعدد من الموضوع التالي.
+أنشئ {count} سؤال اختيار من متعدد من النص التالي.
 
 قواعد صارمة:
 - 4 خيارات لكل سؤال
-- شرح موسع وعميق للإجابة الصحيحة
-- شرح مختصر لكل خيار خاطئ
-- لا تكرر الأفكار
-- مستوى تعليمي واضح
+- شرح للإجابة الصحيحة
 - أعد JSON فقط
 
 الصيغة:
@@ -60,38 +54,34 @@ def build_prompt(topic: str, lang: str, count: int):
  ]
 }}
 
-الموضوع:
-{topic}
+النص:
+{text}
 """
-
-app = FastAPI()
 
 @app.post("/ask-file")
 async def ask_file(
     file: UploadFile = File(...),
     language: str = Form("ar"),
-    num_questions: int = Form(10),
-    mode: str = Form("questions")
+    num_questions: int = Form(10)
 ):
     content = await file.read()
     try:
         text = content.decode("utf-8", errors="ignore")
     except:
-        raise HTTPException(status_code=400, detail="Invalid file")
+        raise HTTPException(status_code=400, detail="Invalid text")
 
-    batch_size = min(max(num_questions, 5), 20)
+    if len(text.strip()) < 50:
+        raise HTTPException(status_code=400, detail="Text too short")
 
-    for attempt in range(MAX_RETRY + 1):
-        try:
-            model = get_model()
-            prompt = build_prompt(text, language, batch_size)
-            response = model.generate_content(prompt)
-            data = safe_json(response.text)
+    model = get_model()
+    prompt = build_prompt(text, language, num_questions)
+    response = model.generate_content(prompt)
 
-            if not data or "questions" not in data:
-                raise ValueError("Invalid JSON from model")
+    raw = response.text
+    start = raw.find("{")
+    end = raw.rfind("}") + 1
 
-            return data
-        except Exception as e:
-            if attempt == MAX_RETRY:
-                raise HTTPException(status_code=500, detail=str(e))
+    if start == -1 or end == -1:
+        raise HTTPException(status_code=500, detail="Invalid model response")
+
+    return json.loads(raw[start:end])
