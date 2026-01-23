@@ -1,4 +1,3 @@
-# render.yaml
 services:
   - type: web
     name: smart-ai-backend
@@ -14,3 +13,5 @@ services:
     envVars:
       - key: TESSDATA_PREFIX
         value: /usr/share/tesseract-ocr/4.00/tessdata
+      - key: LANG
+        value: C.UTF-8
