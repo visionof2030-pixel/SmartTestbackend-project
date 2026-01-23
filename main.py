@@ -1,13 +1,14 @@
-# main.py
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+import os
+import json
+import base64
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
-import pdfplumber
-import pytesseract
-import cv2
-import numpy as np
-from PIL import Image
-import io, os, json, itertools
+
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+
+MODEL_VISION = "gemini-2.5-flash-lite"
+MODEL_TEXT = "gemini-2.5-flash-lite"
 
 app = FastAPI()
 
@@ -18,52 +19,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL = "gemini-2.5-flash-lite"
+def vision_to_text(image_bytes: bytes, lang: str):
+    model = genai.GenerativeModel(MODEL_VISION)
+    prompt = (
+        "اقرأ هذه الصورة واستخرج محتواها التعليمي بدقة وبترتيب واضح."
+        if lang == "ar"
+        else "Read this image and extract the educational content clearly and accurately."
+    )
+    image_b64 = base64.b64encode(image_bytes).decode()
+    response = model.generate_content(
+        [
+            {"mime_type": "image/jpeg", "data": image_b64},
+            prompt,
+        ]
+    )
+    return response.text.strip()
 
-keys = [os.getenv(f"GEMINI_KEY_{i}") for i in range(1, 12)]
-keys = [k for k in keys if k]
-key_cycle = itertools.cycle(keys)
+def generate_questions(text: str, lang: str, count: int):
+    model = genai.GenerativeModel(MODEL_TEXT)
+    prompt = f"""
+{"اكتب باللغة العربية الفصحى." if lang=="ar" else "Write in clear academic English."}
 
-def get_model():
-    genai.configure(api_key=next(key_cycle))
-    return genai.GenerativeModel(MODEL)
+أنشئ {count} سؤال اختيار من متعدد من النص التالي.
 
-def extract_text_from_image(raw: bytes, lang: str) -> str:
-    image = Image.open(io.BytesIO(raw)).convert("RGB")
-    img = np.array(image)
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    gray = cv2.GaussianBlur(gray, (5,5), 0)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    ocr_lang = "ara" if lang == "ar" else "eng"
-    text = pytesseract.image_to_string(thresh, lang=ocr_lang, config="--psm 6")
-    return text.strip()
-
-def extract_text(file: UploadFile, raw: bytes, lang: str) -> str:
-    name = file.filename.lower()
-    if name.endswith(".txt"):
-        return raw.decode("utf-8", errors="ignore")
-    if name.endswith(".pdf"):
-        text = ""
-        with pdfplumber.open(io.BytesIO(raw)) as pdf:
-            for page in pdf.pages:
-                t = page.extract_text()
-                if t:
-                    text += t + "\n"
-        return text
-    if name.endswith((".png",".jpg",".jpeg")):
-        return extract_text_from_image(raw, lang)
-    return ""
-
-def build_prompt(text: str, lang: str, count: int):
-    rule = "Write in clear English." if lang=="en" else "اكتب الناتج النهائي باللغة العربية الفصحى."
-    return f"""
-{rule}
-
-المحتوى قد يكون كلمة واحدة أو موضوعًا عامًا أو نصًا طويلًا.
-
-المطلوب:
-- أنشئ {count} سؤال اختيار من متعدد
-- شرح موسع ودقيق للإجابة الصحيحة
+الشروط:
+- 4 خيارات
+- شرح موسع للإجابة الصحيحة
 - شرح مختصر لكل خيار خاطئ
 - أعد JSON فقط
 
@@ -71,7 +52,7 @@ def build_prompt(text: str, lang: str, count: int):
 {{
  "questions":[
   {{
-   "q":"",
+   "question":"",
    "options":["","","",""],
    "answer":0,
    "explanations":["","","",""]
@@ -79,25 +60,100 @@ def build_prompt(text: str, lang: str, count: int):
  ]
 }}
 
-المحتوى:
+النص:
 {text}
 """
+    r = model.generate_content(prompt)
+    data = json.loads(r.text[r.text.find("{"):r.text.rfind("}")+1])
+    return data
 
-@app.post("/ask-file")
-async def ask_file(
+def generate_cards(text: str, lang: str, count: int):
+    model = genai.GenerativeModel(MODEL_TEXT)
+    prompt = f"""
+{"اكتب بالعربية." if lang=="ar" else "Write in English."}
+
+أنشئ {count} بطاقات تعليمية (تعريف ← شرح).
+
+أعد JSON فقط:
+{{
+ "cards":[
+  {{
+   "front":"",
+   "back":""
+  }}
+ ]
+}}
+
+النص:
+{text}
+"""
+    r = model.generate_content(prompt)
+    return json.loads(r.text[r.text.find("{"):r.text.rfind("}")+1])
+
+def generate_summary(text: str, lang: str):
+    model = genai.GenerativeModel(MODEL_TEXT)
+    prompt = f"""
+{"اكتب بالعربية." if lang=="ar" else "Write in English."}
+
+لخّص النص مع:
+- تعريفات أساسية
+- ربط مفاهيم
+- نقاط واضحة
+
+النص:
+{text}
+"""
+    r = model.generate_content(prompt)
+    return {"summary": r.text.strip()}
+
+@app.post("/quiz")
+async def quiz(
+    text: str = Form(...),
+    language: str = Form("ar"),
+    number_of_questions: int = Form(10),
+):
+    return generate_questions(text, language, number_of_questions)
+
+@app.post("/flashcards")
+async def flashcards(
+    text: str = Form(...),
+    language: str = Form("ar"),
+    number_of_questions: int = Form(10),
+):
+    return generate_cards(text, language, number_of_questions)
+
+@app.post("/summary")
+async def summary(
+    text: str = Form(...),
+    language: str = Form("ar"),
+):
+    return generate_summary(text, language)
+
+@app.post("/file/quiz")
+async def quiz_from_file(
     file: UploadFile = File(...),
     language: str = Form("ar"),
-    num_questions: int = Form(10)
+    number_of_questions: int = Form(10),
 ):
-    raw = await file.read()
-    text = extract_text(file, raw, language).strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="تعذر قراءة المحتوى")
-    model = get_model()
-    response = model.generate_content(build_prompt(text, language, num_questions))
-    raw_out = response.text or ""
-    s = raw_out.find("{")
-    e = raw_out.rfind("}") + 1
-    if s==-1 or e==-1:
-        raise HTTPException(status_code=500, detail="رد غير صالح")
-    return json.loads(raw_out[s:e])
+    image_bytes = await file.read()
+    text = vision_to_text(image_bytes, language)
+    return generate_questions(text, language, number_of_questions)
+
+@app.post("/file/flashcards")
+async def cards_from_file(
+    file: UploadFile = File(...),
+    language: str = Form("ar"),
+    number_of_questions: int = Form(10),
+):
+    image_bytes = await file.read()
+    text = vision_to_text(image_bytes, language)
+    return generate_cards(text, language, number_of_questions)
+
+@app.post("/file/summary")
+async def summary_from_file(
+    file: UploadFile = File(...),
+    language: str = Form("ar"),
+):
+    image_bytes = await file.read()
+    text = vision_to_text(image_bytes, language)
+    return generate_summary(text, language)
