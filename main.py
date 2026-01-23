@@ -1,8 +1,9 @@
 import os
 import json
-import base64
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image
+import io
 import google.generativeai as genai
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
@@ -19,26 +20,36 @@ app.add_middleware(
 )
 
 def vision_to_text(image_bytes: bytes, lang: str) -> str:
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
     model = genai.GenerativeModel(MODEL)
+
     prompt = (
-        "اقرأ هذه الصورة واستخرج النص التعليمي منها بترتيب واضح ودقيق."
+        "اقرأ هذه الصورة واستخرج النص التعليمي منها بوضوح وترتيب."
         if lang == "ar"
-        else "Read this image and extract the educational text clearly and accurately."
+        else "Read this image and extract the educational content clearly and in order."
     )
-    image_b64 = base64.b64encode(image_bytes).decode()
-    response = model.generate_content(
-        [
-            {"mime_type": "image/jpeg", "data": image_b64},
-            prompt,
-        ]
-    )
+
+    response = model.generate_content([prompt, image])
+
     text = response.text.strip()
-    if len(text) < 20:
-        raise HTTPException(status_code=400, detail="تعذر قراءة محتوى واضح من الصورة")
+
+    if not text or len(text) < 20:
+        raise HTTPException(
+            status_code=400,
+            detail="تعذر استخراج نص واضح من الصورة"
+        )
+
     return text
+
+def safe_json(text: str):
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    return json.loads(text[start:end])
 
 def generate_questions(text: str, lang: str, count: int):
     model = genai.GenerativeModel(MODEL)
+
     prompt = f"""
 {"اكتب باللغة العربية الفصحى." if lang=="ar" else "Write in clear academic English."}
 
@@ -49,7 +60,7 @@ def generate_questions(text: str, lang: str, count: int):
 - شرح موسع ودقيق للإجابة الصحيحة
 - شرح مختصر لكل خيار خاطئ
 - لا تكرر الأفكار
-- أعد JSON فقط دون أي نص إضافي
+- أعد JSON فقط دون أي شرح إضافي
 
 الصيغة:
 {{
@@ -66,18 +77,19 @@ def generate_questions(text: str, lang: str, count: int):
 النص:
 {text}
 """
+
     r = model.generate_content(prompt)
-    raw = r.text[r.text.find("{"):r.text.rfind("}")+1]
-    return json.loads(raw)
+    return safe_json(r.text)
 
 def generate_flashcards(text: str, lang: str, count: int):
     model = genai.GenerativeModel(MODEL)
+
     prompt = f"""
 {"اكتب بالعربية." if lang=="ar" else "Write in English."}
 
 أنشئ {count} بطاقات تعليمية.
 كل بطاقة تحتوي:
-- front: مفهوم أو مصطلح
+- front: مصطلح أو مفهوم
 - back: تعريف واضح وربط مفاهيمي
 
 أعد JSON فقط:
@@ -93,23 +105,22 @@ def generate_flashcards(text: str, lang: str, count: int):
 النص:
 {text}
 """
+
     r = model.generate_content(prompt)
-    raw = r.text[r.text.find("{"):r.text.rfind("}")+1]
-    return json.loads(raw)
+    return safe_json(r.text)
 
 def generate_summary(text: str, lang: str):
     model = genai.GenerativeModel(MODEL)
+
     prompt = f"""
 {"اكتب بالعربية." if lang=="ar" else "Write in English."}
 
 لخّص النص مع التركيز على:
 - التعريفات الأساسية
 - ربط المفاهيم
-- نقاط واضحة ومباشرة
-
-النص:
-{text}
+- صياغة تعليمية واضحة
 """
+
     r = model.generate_content(prompt)
     return {"summary": r.text.strip()}
 
